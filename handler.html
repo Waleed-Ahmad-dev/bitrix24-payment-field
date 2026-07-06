@@ -17,6 +17,7 @@
         .field-label { font-size: 11px; font-weight: 700; color: #a1a6b1; text-transform: uppercase; }
         .bx-input, .bx-select { width: 100%; height: 38px; padding: 0 12px; border: 1px solid #cbd0da; border-radius: 4px; color: #424956; background: #fff; outline: none; transition: border-color 0.15s; appearance: none; -webkit-appearance: none; }
         .bx-input:focus, .bx-select:focus { border-color: #2fc6f6; }
+        .bx-input[readonly] { background: #f4f7f9; color: #6b7280; cursor: not-allowed; }
         .select-wrapper { position: relative; }
         .select-wrapper::after { content: ""; position: absolute; right: 12px; top: 50%; transform: translateY(-50%); width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid #a1a6b1; pointer-events: none; }
         .balloon-section { padding: 12px 16px 4px; }
@@ -32,6 +33,9 @@
         .custom-block-label { font-size: 11px; font-weight: 700; color: #2fc6f6; text-transform: uppercase; padding: 10px 16px 2px; }
         .divider { height: 1px; background: #f2f4f7; margin: 8px 0; }
         .save-indicator { font-size: 11px; color: #2fc6f6; font-weight: 600; padding: 2px 16px; text-align: right; min-height: 16px; }
+        .installment-preview-list { display: flex; flex-direction: column; gap: 4px; margin-top: 2px; }
+        .installment-preview-item { display: flex; justify-content: space-between; background: #f8fafc; border: 1px solid #ddecfa; border-radius: 4px; padding: 7px 10px; font-size: 12px; color: #424956; }
+        .installment-preview-item .inst-num { font-weight: 700; color: #2fc6f6; }
     </style>
 </head>
 <body>
@@ -58,6 +62,15 @@
         <div class="field-group half">
             <span class="field-label">Discount %</span>
             <input type="number" class="bx-input" id="discountPct" placeholder="0" min="0" max="100" step="0.01">
+        </div>
+    </div>
+
+    <!-- Fixed Completion/Handover milestone (30-Jun-2028). Applies to every payment plan
+         (60/40, 3 Years, 5 Years, Full Payment, Custom) and is not user-editable. -->
+    <div class="field-row">
+        <div class="field-group">
+            <span class="field-label">Completion / Handover Date</span>
+            <input type="text" class="bx-input" id="handoverDate" readonly title="Fixed milestone date — applies to every payment plan">
         </div>
     </div>
 
@@ -89,18 +102,14 @@
             </div>
         </div>
         <div class="field-row">
-            <div class="field-group half">
+            <div class="field-group">
                 <span class="field-label">On Possession %</span>
                 <input type="number" class="bx-input" id="possessionPct" placeholder="0">
-            </div>
-            <div class="field-group half">
-                <span class="field-label">On Possession Date</span>
-                <input type="date" class="bx-input" id="possessionDate">
             </div>
         </div>
         <div class="field-row">
             <div class="field-group half">
-                <span class="field-label">Payment Plan</span>
+                <span class="field-label">Post-Handover Frequency</span>
                 <div class="select-wrapper">
                     <select class="bx-select" id="innerPaymentPlan">
                         <option value="">— Select —</option>
@@ -112,8 +121,15 @@
                 </div>
             </div>
             <div class="field-group half">
-                <span class="field-label">Payment Plan Units</span>
-                <input type="number" class="bx-input" id="paymentPlanUnits" placeholder="0">
+                <span class="field-label">Number of Installments</span>
+                <input type="number" class="bx-input" id="paymentPlanUnits" placeholder="0" min="0" step="1">
+            </div>
+        </div>
+        <!-- Auto-calculated from the fixed Handover Date above; every installment lands on the 30th -->
+        <div class="field-row" id="installmentPreviewRow" style="display:none;">
+            <div class="field-group">
+                <span class="field-label">Post-Handover Installment Dates</span>
+                <div id="installmentPreview" class="installment-preview-list"></div>
             </div>
         </div>
     </div>
@@ -121,11 +137,97 @@
 
 <script>
 // Verified hidden string field database key
-const STORAGE_FIELD_KEY = "UF_CRM_1781407734871"; 
+const STORAGE_FIELD_KEY = "UF_CRM_1781407734871";
+
+// FIXED: Completion / Handover milestone. Applies to every payment plan (60/40, 3 Years,
+// 5 Years, Full Payment, Custom) and is the single anchor date that post-handover
+// installments are calculated from. Update this ONE constant if the project timeline ever shifts.
+const HANDOVER_DATE = '2028-06-30';
+
+// Months to add per installment, based on the selected post-handover frequency
+const FREQUENCY_MONTHS = { monthly: 1, quarterly: 3, biannually: 6, annually: 12 };
+
+// Safety cap so a mistyped installment count can't generate an unreasonable number of rows
+const MAX_INSTALLMENTS = 60;
 
 let balloonCounter = 0;
 let currentDealId = null;
 let saveTimeout = null;
+
+function parseISODate(dateStr) {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    return new Date(y, m - 1, d);
+}
+
+function formatISODate(d) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function formatDisplayDate(d) {
+    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return `${String(d.getDate()).padStart(2, '0')}-${MONTHS[d.getMonth()]}-${d.getFullYear()}`;
+}
+
+/**
+ * Adds `monthsToAdd` calendar months to a 'YYYY-MM-DD' date string, then forces the
+ * result onto the 30th of that month. February never has a 30th, so it falls back to
+ * the last real day of that month (28th, or 29th in a leap year).
+ *
+ * Moving to day 1 of the target month first avoids the classic JS "day overflow" bug,
+ * where e.g. adding 1 month to Jan 31 lands in March instead of February.
+ */
+function addMonthsClampedTo30(dateStr, monthsToAdd) {
+    const base = parseISODate(dateStr);
+    const firstOfTargetMonth = new Date(base.getFullYear(), base.getMonth() + monthsToAdd, 1);
+    const ty = firstOfTargetMonth.getFullYear();
+    const tm = firstOfTargetMonth.getMonth();
+    const lastDayOfTargetMonth = new Date(ty, tm + 1, 0).getDate();
+    const day = Math.min(30, lastDayOfTargetMonth);
+    return new Date(ty, tm, day);
+}
+
+/**
+ * Builds the full post-handover installment schedule from the fixed HANDOVER_DATE.
+ * Every installment — including the 6th — always lands on the 30th of its month.
+ */
+function computePostHandoverInstallments() {
+    const freq = document.getElementById('innerPaymentPlan').value;
+    const unitsRaw = parseInt(document.getElementById('paymentPlanUnits').value, 10);
+    if (!freq || !unitsRaw || unitsRaw < 1) return [];
+
+    const units = Math.min(unitsRaw, MAX_INSTALLMENTS);
+    const stepMonths = FREQUENCY_MONTHS[freq];
+    const list = [];
+    for (let i = 1; i <= units; i++) {
+        const d = addMonthsClampedTo30(HANDOVER_DATE, stepMonths * i);
+        list.push({ installment: i, iso: formatISODate(d), display: formatDisplayDate(d) });
+    }
+    return list;
+}
+
+function renderPostHandoverInstallments() {
+    const list = computePostHandoverInstallments();
+    const row = document.getElementById('installmentPreviewRow');
+    const box = document.getElementById('installmentPreview');
+    box.innerHTML = '';
+
+    if (list.length === 0) {
+        row.style.display = 'none';
+        return;
+    }
+
+    row.style.display = 'flex';
+    list.forEach(item => {
+        const div = document.createElement('div');
+        div.className = 'installment-preview-item';
+        div.innerHTML = `<span class="inst-num">Installment ${item.installment}</span><span>${item.display}</span>`;
+        box.appendChild(div);
+    });
+    notifyResize();
+}
+
+// Show the fixed handover date immediately — it doesn't depend on CRM data loading
+document.getElementById('handoverDate').value = formatDisplayDate(parseISODate(HANDOVER_DATE));
 
 function addBalloonRow() {
     balloonCounter++;
@@ -170,21 +272,24 @@ function collectData() {
         }
     });
     return {
-        paymentPlan:     plan,
-        discountPct:     document.getElementById('discountPct').value || '0',
-        balloonPayments: balloons,
-        totalAmount:     document.getElementById('totalAmount').value || '',
-        downpaymentPct:  document.getElementById('downpaymentPct').value || '',
-        downpaymentDate: document.getElementById('downpaymentDate').value || '',
-        possessionPct:   document.getElementById('possessionPct').value || '',
-        possessionDate:  document.getElementById('possessionDate').value || '',
-        innerPaymentPlan:document.getElementById('innerPaymentPlan').value || '',
-        paymentPlanUnits:document.getElementById('paymentPlanUnits').value || ''
+        paymentPlan:      plan,
+        discountPct:      document.getElementById('discountPct').value || '0',
+        balloonPayments:  balloons,
+        handoverDate:     HANDOVER_DATE, // fixed 2028-06-30, applies to every payment plan
+        possessionDate:   HANDOVER_DATE, // kept for backward compatibility with older saved records
+        totalAmount:      document.getElementById('totalAmount').value || '',
+        downpaymentPct:   document.getElementById('downpaymentPct').value || '',
+        downpaymentDate:  document.getElementById('downpaymentDate').value || '',
+        possessionPct:    document.getElementById('possessionPct').value || '',
+        innerPaymentPlan: document.getElementById('innerPaymentPlan').value || '',
+        paymentPlanUnits: document.getElementById('paymentPlanUnits').value || '',
+        postHandoverInstallments: computePostHandoverInstallments()
     };
 }
 
 // Background Save directly using CRM REST API
 function handleDataChange() {
+    renderPostHandoverInstallments();
     clearTimeout(saveTimeout);
     document.getElementById('saveIndicator').innerText = "Typing...";
     
@@ -238,10 +343,14 @@ function populateFields(rawValue) {
                 document.getElementById('balloonRows').appendChild(row);
             });
         }
-        ['totalAmount','downpaymentPct','downpaymentDate','possessionPct','possessionDate','paymentPlanUnits'].forEach(id => {
+        // Note: handoverDate/possessionDate are intentionally NOT read from stored data —
+        // the milestone is fixed at 30-Jun-2028 for every deal, regardless of what was saved before.
+        ['totalAmount','downpaymentPct','downpaymentDate','possessionPct','paymentPlanUnits'].forEach(id => {
             if (data[id]) document.getElementById(id).value = data[id];
         });
         if (data.innerPaymentPlan) document.getElementById('innerPaymentPlan').value = data.innerPaymentPlan;
+
+        renderPostHandoverInstallments();
     } catch(e) { console.error("Data parse error", e); }
 }
 
